@@ -36,13 +36,17 @@ class MCLoop:
         self.current_in_flight_memory: int = 0
 
         # create the task and results queue. 
-        self.tasks_queue: Queue  = interpreters.create_queue(maxsize=128)
-        self.results_queue: Queue = interpreters.create_queue()
+        self.tasks_queue = interpreters.create_queue(maxsize=128)
+        self.results_queue = interpreters.create_queue()
 
         # create the metrics holders.
         self.interpreters: list = []
         self.pending_jobs: dict = {}
         self._job_counter: int = 0 
+
+        # store the sub interpreter worker handles, to close them gracefully 
+        # when shutting down. 
+        self._worker_handles: list = []
 
         # create the interpreters and launch them for accepting workloads. 
         self._bootstrap_workers()
@@ -51,13 +55,18 @@ class MCLoop:
         """
         Create the sub interpreters and launch them for workload executions. 
         """
+
         for _ in range(self.total_interpreters):
             new_interpreter = interpreters.create()
             self.interpreters.append(new_interpreter)
 
             # spin up a dedicated OS background for each interpreter. 
             # bind the worker loop here, so it keeps executing infinitely for new coming jobs. 
-            new_interpreter.call_in_thread(_worker_loop, self.tasks_queue, self.results_queue)
+            ip_thread_handle = new_interpreter.call_in_thread(_worker_loop, self.tasks_queue, self.results_queue)
+
+            # add the interpreter thread handle to the list. 
+            self._worker_handles.append(ip_thread_handle)
+
 
     # estimate the size of the payload. Too big payloads will stall the pool.
     # this is done to prevent OOM errors from the provided memory size during initialization. 
@@ -65,12 +74,15 @@ class MCLoop:
         """
         estimate the payload size of each job. 
         """
+        payload_size = 0
 
         for argument in args:
             if isinstance(argument, (bytes, bytearray, memoryview)):
-                return len(argument)
+                payload_size += len(argument)
             else:
-                return sys.getsizeof(argument)
+                payload_size += sys.getsizeof(argument)
+
+        return payload_size
 
 
     def poll(self):
@@ -90,7 +102,7 @@ class MCLoop:
                 self.pending_jobs[job_id]["ready"] = True
 
 
-    def submit(self, fn, args) -> int:
+    def submit(self, fn, *args) -> int:
         """
         Submit the workload to the queue. 
         """
@@ -127,12 +139,12 @@ class MCLoop:
             if self.pending_jobs.get(job_id, {}).get("ready"):
                 entry = self.pending_jobs.pop(job_id)
                 if entry["error"]:
-                    raise RuntimeError(f"Job {job_id} failed: Error {entry["error"]}")
+                    raise RuntimeError(f"Job {job_id} failed: Error {entry['error']}")
 
                 return entry["result"]
 
             # check the time boundary here. 
-            if timeout is not None and (time.monotonic - start_time) > timeout:
+            if timeout is not None and (time.monotonic() - start_time) > timeout:
                 raise TimeoutError(f"Job {job_id} timeout!")
 
             # let the event loop circle back withing suspended tasks
@@ -146,12 +158,17 @@ class MCLoop:
         Shutdown all the sub interpreters. 
         """
         # put one SENTINEL per sub interpreter. 
-        for _ in self.total_interpreters:
+        for _ in range(self.total_interpreters):
             self.tasks_queue.put(_SENTINEL)
 
+        # tear down the sub interpreter threads. 
+        for sip_thread_handle in self._worker_handles:
+            sip_thread_handle.join()
+        
         # close the sub interpreters. 
         for sub_interpreter in self.interpreters:
             sub_interpreter.close()
+
 
         # clear the sub interpreters list. 
         self.interpreters.clear()
