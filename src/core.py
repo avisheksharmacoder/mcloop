@@ -1,78 +1,180 @@
 from concurrent import interpreters
 import sys
-from queue import Queue
 import time
+
+import asyncio
+import socket
+import os
+
+
+# for test. 
+# Inside src/core.py
+def compute_hash(n: int) -> int:
+    val = 0
+    for i in range(n):
+        val = (val ^ (i * 2654435761)) & 0xFFFFFFFF
+    return val
 
 
 # shut down signal for the LOOP. 
 _SENTINEL = "__MCLOOP_SHUTDOWN__"
 
 # sentinel worker loop. 
-def _worker_loop(tasks_queue, results_queue):
+def _worker_loop(tasks_queue, results_queue, notify_fd: int):
+    """
+    This worker loop runs isolated inside a subinterpreter. 
+    Executes tasks and signals the main reactor via the OS kernel descriptor. 
+    """
     while True:
-        worker_task = tasks_queue.get()
+        try:
+            worker_task = tasks_queue.get()
+        except Exception as e:
+            # Prevent the silent worker death, if queue get or unpickling raises. 
+            results_queue.put((-1, None, f"Error received: {e}", 0))
+
+            try:
+                os.write(notify_fd, b"\x01")
+            except (BlockingIOError, OSError):
+                pass
+            continue
 
         # break if called for shut down. 
-        if worker_task == "__MCLOOP_SHUTDOWN__":
+        if worker_task == _SENTINEL:
             break
+
+        # get the job id, function, arguments, memory cost from the task. 
+        job_id, fn, args, memory_cost = worker_task
 
         # execute the user job. 
         try:
-            job_id, fn, args, memory_cost = worker_task
             results = fn(*args)
             results_queue.put((job_id, results, None, memory_cost))
 
         except Exception as e:
             results_queue.put((job_id, None, str(e), memory_cost))
 
+        finally:
+            # wake up the main interpreter event loop via a non blocking os write.
+            try:
+                os.write(notify_fd, b"\x01")
+            except (BlockingIOError, OSError):
+                # If the buffer is full, the main loop is already scheduled to wake up. 
+                pass 
+
 
 class MCLoop:
     """
-    Create a pool of interpreters. 
+    Create a pool of interpreters.
+    The pool is driven by an OS descriptor Reactor bridge. 
     """
-    def __init__(self, no_of_interpreters: int = 2, total_memory: int = 100 * 1024 * 1024):
+    def __init__(
+            self, 
+            no_of_interpreters: int = 2, 
+            total_memory: int = 100 * 1024 * 1024,
+            loop: asyncio.AbstractEventLoop | None = None
+    ):
         self.total_interpreters: int = no_of_interpreters
         self.total_memory: int = total_memory
         self.current_in_flight_memory: int = 0
+        self.loop = loop or asyncio.get_event_loop()
 
-        # create the task and results queue. 
-        self.tasks_queue = interpreters.create_queue(maxsize=128)
+        # create the tasks and results MPMC queues. 
+        self.tasks_queue = interpreters.create_queue()
         self.results_queue = interpreters.create_queue()
+
+        # OS notification channels using Python stdlib sockets. 
+        self._read_sock, self._write_sock = socket.socketpair()
+        self._read_sock.setblocking(False)
+        self._write_sock.setblocking(False)
+        self.notify_fd = self._write_sock.fileno()
+
+        # job tracking and futures. 
+        self.pending_futures: dict[int, asyncio.Future] = {}
+        self._job_counter: int = 0 
 
         # create the metrics holders.
         self.interpreters: list = []
-        self.pending_jobs: dict = {}
-        self._job_counter: int = 0 
 
         # store the sub interpreter worker handles, to close them gracefully 
         # when shutting down. 
         self._worker_handles: list = []
 
+        # hook the read socket into the asyncio reactor. 
+        self.loop.add_reader(self._read_sock.fileno(), self._on_worker_notify)
+
         # create the interpreters and launch them for accepting workloads. 
         self._bootstrap_workers()
+
 
     def _bootstrap_workers(self) -> None:
         """
         Create the sub interpreters and launch them for workload executions. 
+        Also sync the environment paths for the new subinterpreters. 
         """
+        # sync parent paths for the worker loops. 
+        sync_path_code = f"import sys\nsys.path[:] = {sys.path!r}\n"
 
         for _ in range(self.total_interpreters):
             new_interpreter = interpreters.create()
             self.interpreters.append(new_interpreter)
 
+            new_interpreter.exec(sync_path_code)
+
             # spin up a dedicated OS background for each interpreter. 
             # bind the worker loop here, so it keeps executing infinitely for new coming jobs. 
-            ip_thread_handle = new_interpreter.call_in_thread(_worker_loop, self.tasks_queue, self.results_queue)
+            ip_thread_handle = new_interpreter.call_in_thread(
+                _worker_loop, 
+                self.tasks_queue, 
+                self.results_queue,
+                self.notify_fd
+            )
 
             # add the interpreter thread handle to the list. 
             self._worker_handles.append(ip_thread_handle)
+
+
+    def _on_worker_notify(self) -> None:
+        """
+        Reactor callback fired by the OS when any subinterpreter writes a byte.
+        Drains both the notification and the results queue. 
+        """
+
+        # Drain the notification bytes, so the descriptor resets in the kernel. 
+        try:
+            while True:
+                chunk = self._read_sock.recv(4096)
+                if not chunk:
+                    break
+
+        except (BlockingIOError, InterruptedError):
+            pass
+
+        # Drain all the completed results in the queue, 
+        # if it is found to be filled up. 
+        while not self.results_queue.empty():
+            try:
+                job_id, result, error, memory_cost = self.results_queue.get_nowait()
+
+            except Exception:
+                break
+
+            # reduce the inflight memory size by the workload size. 
+            self.current_in_flight_memory = max(0, self.current_in_flight_memory - memory_cost)
+
+            future = self.pending_futures.pop(job_id, None)
+            if future and not future.done():
+                if error is not None:
+                    future.set_exception(RuntimeError(error))
+                else:
+                    future.set_result(result)
+
 
 
     # estimate the size of the payload. Too big payloads will stall the pool.
     # this is done to prevent OOM errors from the provided memory size during initialization. 
     def _estimate_payload_size(self, *args) -> int:
         """
-        estimate the payload size of each job. 
+        Estimate the payload size of each job for memory tracking (approx) 
         """
         payload_size = 0
 
@@ -85,22 +187,6 @@ class MCLoop:
         return payload_size
 
 
-    def poll(self):
-        """
-        update the status of jobs in the pending jobs collection. 
-        """
-        while not self.results_queue.empty():
-            job_id, job_result, job_error, job_memory_cost = self.results_queue.get_nowait()
-
-            # calculate the current available inflight memory. 
-            self.current_in_flight_memory = max(0, self.current_in_flight_memory - job_memory_cost)
-
-            # update the status of the job id inthe pending jobs dictionary (fast)
-            if job_id in self.pending_jobs:
-                self.pending_jobs[job_id]["result"] = job_result
-                self.pending_jobs[job_id]["error"] = job_error
-                self.pending_jobs[job_id]["ready"] = True
-
 
     def submit(self, fn, *args) -> int:
         """
@@ -112,15 +198,14 @@ class MCLoop:
         # check memory, if full, poll(). 
         # if still not cleared, then raise BufferError()
         if self.current_in_flight_memory + memory_cost > self.total_memory:
-            self.poll()
-            if self.current_in_flight_memory + memory_cost > self.total_memory:
-                raise BufferError("Insufficient memory")
+            raise BufferError("Insufficient memory")
 
         self._job_counter += 1
         job_id = self._job_counter
 
         # set up the job in the pending jobs as a dictionary. 
-        self.pending_jobs[job_id] = {"ready": False, "result": None, "error": None} 
+        future = self.loop.create_future()
+        self.pending_futures[job_id] = future
 
         # increment the memory cost now, after job is added. 
         self.current_in_flight_memory += memory_cost
@@ -128,36 +213,21 @@ class MCLoop:
         # put the job in the task queue. 
         self.tasks_queue.put((job_id, fn, args, memory_cost))
 
-        return job_id
-
-
-    def fetch(self, job_id, timeout: float = None):
-        start_time = time.monotonic()
-
-        while True:
-            self.poll()
-            if self.pending_jobs.get(job_id, {}).get("ready"):
-                entry = self.pending_jobs.pop(job_id)
-                if entry["error"]:
-                    raise RuntimeError(f"Job {job_id} failed: Error {entry['error']}")
-
-                return entry["result"]
-
-            # check the time boundary here. 
-            if timeout is not None and (time.monotonic() - start_time) > timeout:
-                raise TimeoutError(f"Job {job_id} timeout!")
-
-            # let the event loop circle back withing suspended tasks
-            # to check for completion. 
-            time.sleep(0.001)
-
+        return future
 
 
     def close(self):
         """
-        Shutdown all the sub interpreters. 
+        Tear down descriptors and close subinterpreters. 
         """
-        # put one SENTINEL per sub interpreter. 
+
+        # first, unregister from the event loop. 
+        try:
+            self.loop.remove_reader(self._read_sock.fileno())
+        except Exception:
+            pass
+
+        # put one SENTINEL per sub interpreter to close it down. 
         for _ in range(self.total_interpreters):
             self.tasks_queue.put(_SENTINEL)
 
@@ -172,6 +242,11 @@ class MCLoop:
 
         # clear the sub interpreters list. 
         self.interpreters.clear()
+        self._worker_handles.clear()
+
+        # Close the OS sockets. 
+        self._read_sock.close()
+        self._write_sock.close()
 
 
 
